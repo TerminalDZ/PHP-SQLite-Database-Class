@@ -11,53 +11,57 @@
  * @version   1.0.0
  */
 
-require_once 'config.php';
 class Database {
+    /**
+     * Static instance of self
+     *
+     * @var Database
+     */
+    protected static $_instance;
+
     private $pdo;
     private $stmt;
-    private static $_instance;
     protected $_query;
+    protected $_lastQuery;
+    protected $_queryOptions = array();
+    protected $_join = array();
+    protected $_joinAnd = array();
     protected $_where = array();
-    protected $_join = array(); 
     protected $_having = array();
     protected $_orderBy = array();
     protected $_groupBy = array();
-    protected $_queryOptions = array();
     protected $_bindParams = array();
+    protected $_updateColumns = null;
+    protected $_nestJoin = false;
+    protected $_forUpdate = false;
+    protected $_lockInShareMode = false;
+    protected $_tableName = '';
+    protected $_lastInsertId = null;
+    protected $_mapKey = null;
+    protected $_transaction_in_progress = false;
+    protected $_fetchMode = PDO::FETCH_ASSOC;
     public $count = 0;
     public $totalCount = 0;
     public static $prefix = '';
+    public $pageLimit = 20;
+    public $totalPages = 0;
 
     public function __construct() {
         try {
             $this->pdo = new PDO('sqlite:' . DB_PATH);
             $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+            self::$_instance = $this;
         } catch (PDOException $e) {
             die("Failed to connect to the database: " . $e->getMessage());
         }
     }
 
-    public function getValue($tableName, $column, $numRows = null)
-{
-    $result = $this->get($tableName, $numRows, $column);
-    
-    if (is_array($result) && count($result) > 0) {
-        return array_values($result[0])[0];
-    }
-    
-    return null;
-}
-
-public function groupBy($columns) {
-    if (is_array($columns)) {
-        $this->_groupBy = array_merge($this->_groupBy, $columns);
-    } else {
-        $this->_groupBy[] = $columns;
-    }
-    return $this;
-}
-
-
+    /**
+     * A method of returning the static instance to allow access to the
+     * instantiated object from within another class.
+     *
+     * @return Database Returns the current instance.
+     */
     public static function getInstance() {
         if (self::$_instance === null) {
             self::$_instance = new self();
@@ -65,229 +69,579 @@ public function groupBy($columns) {
         return self::$_instance;
     }
 
-    public function query($sql, $params = array()) {
-        $stmt = $this->pdo->prepare($sql);
-        $stmt->execute($params);
-        return $stmt->fetchAll(PDO::FETCH_ASSOC);
-    }
-
-
-    public function join($table, $condition, $type = 'INNER') {
-        $this->_join[] = "$type JOIN $table ON $condition";
+    /**
+     * Reset states after an execution
+     *
+     * @return Database Returns the current instance.
+     */
+    protected function reset() {
+        $this->_where = array();
+        $this->_having = array();
+        $this->_join = array();
+        $this->_joinAnd = array();
+        $this->_orderBy = array();
+        $this->_groupBy = array();
+        $this->_bindParams = array();
+        $this->_query = null;
+        $this->_queryOptions = array();
+        $this->_nestJoin = false;
+        $this->_forUpdate = false;
+        $this->_lockInShareMode = false;
+        $this->_tableName = '';
+        $this->_lastInsertId = null;
+        $this->_updateColumns = null;
+        $this->_mapKey = null;
+        $this->count = 0;
+        $this->totalCount = 0;
         return $this;
     }
 
-    public function where($whereProp, $whereValue = null, $operator = '=') {
-        if (is_array($whereValue) && ($key = key($whereValue)) != "0") {
-            $operator = $key;
-            $whereValue = $whereValue[$key];
-        }
-        
-        if (is_null($whereValue) && $operator == '=') {
-            $operator = 'IS NULL';
-        } elseif (is_null($whereValue)) {
-            $operator = 'IS NOT NULL';
-        }
-        
-        $this->_where[] = array($whereProp, $operator, $whereValue);
+    /**
+     * Method to set a prefix
+     *
+     * @param string $prefix Contains a table prefix
+     *
+     * @return Database
+     */
+    public function setPrefix($prefix) {
+        self::$prefix = $prefix;
         return $this;
     }
 
-    public function orWhere($whereProp, $whereValue = null, $operator = '=') {
-        if (is_array($whereValue) && ($key = key($whereValue)) != "0") {
-            $operator = $key;
-            $whereValue = $whereValue[$key];
-        }
-        
-        if (is_null($whereValue) && $operator == '=') {
-            $operator = 'IS NULL';
-        } elseif (is_null($whereValue)) {
-            $operator = 'IS NOT NULL';
-        }
-        
-        $this->_where[] = array($whereProp, $operator, $whereValue, 'OR');
-        return $this;
+    /**
+     * Execute raw SQL query.
+     *
+     * @param string $query      User-provided query to execute.
+     * @param array  $bindParams Variables array to bind to the SQL statement.
+     *
+     * @return array Contains the returned rows from the query.
+     */
+    public function rawQuery($query, $bindParams = array()) {
+        $this->_query = $query;
+        $this->_bindParams = $bindParams;
+        $stmt = $this->pdo->prepare($this->_query);
+        $stmt->execute($this->_bindParams);
+        $this->reset();
+        return $stmt->fetchAll($this->_fetchMode);
     }
 
+    /**
+     * Get the value of a single column from a single row
+     */
+    public function getValue($tableName, $column, $limit = 1) {
+        $res = $this->get($tableName, $limit, "{$column} AS retval");
+        if (!$res) {
+            return null;
+        }
+        if ($limit == 1) {
+            return isset($res[0]["retval"]) ? $res[0]["retval"] : null;
+        }
+        $newRes = array();
+        for ($i = 0; $i < $this->count; $i++) {
+            $newRes[] = $res[$i]['retval'];
+        }
+        return $newRes;
+    }
+
+    /**
+     * Build the SELECT query
+     */
     public function get($tableName, $numRows = null, $columns = '*') {
         if (empty($columns)) {
             $columns = '*';
         }
         
         $column = is_array($columns) ? implode(', ', $columns) : $columns;
-        
         $table = self::$prefix . $tableName;
-        
-        $this->_query = "SELECT " . $column . " FROM " . $table;
-        
-        // بناء جملة JOIN
-        if (!empty($this->_join)) {
-            $this->_query .= " " . implode(" ", $this->_join);
-        }
+        $this->_tableName = $table;
+        $this->_query = "SELECT " . implode(' ', $this->_queryOptions) . ' ' .
+                        $column . " FROM " . $table;
+                        
+        $this->_buildJoin();
+        $this->_buildWhere();
+        $this->_buildGroupBy();
+        $this->_buildHaving();
+        $this->_buildOrderBy();
+        $this->_buildLimit($numRows);
 
-        // بناء شرط WHERE
-        if (!empty($this->_where)) {
-            $this->_query .= " WHERE";
-            $firstWhere = true;
-            
-            foreach ($this->_where as $where) {
-                if (count($where) === 4) {
-                    list($column, $operator, $value, $concat) = $where;
-                } else {
-                    list($column, $operator, $value) = $where;
-                    $concat = 'AND';
-                }
-                
-                if (!$firstWhere) {
-                    $this->_query .= " $concat";
-                }
-                
-                if ($operator == 'IN' || $operator == 'NOT IN') {
-                    $this->_query .= " $column $operator (" . str_repeat('?,', count($value) - 1) . '?)';
-                    $this->_bindParams = array_merge($this->_bindParams, $value);
-                } else if ($operator == 'BETWEEN') {
-                    $this->_query .= " $column $operator ? AND ?";
-                    $this->_bindParams[] = $value[0];
-                    $this->_bindParams[] = $value[1];
-                } else if ($operator == 'IS NULL' || $operator == 'IS NOT NULL') {
-                    $this->_query .= " $column $operator";
-                } else {
-                    $this->_query .= " $column $operator ?";
-                    $this->_bindParams[] = $value;
-                }
-                
-                $firstWhere = false;
-            }
-        }
-        
-        // إضافة LIMIT
-        if ($numRows !== null) {
-            $this->_query .= " LIMIT " . (int)$numRows;
-        }
-        
         $stmt = $this->pdo->prepare($this->_query);
         $stmt->execute($this->_bindParams);
-        
-        $result = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        $result = $stmt->fetchAll($this->_fetchMode);
+        $this->count = $stmt->rowCount();
         $this->reset();
-        
         return $result;
     }
 
+    /**
+     * Get one row
+     */
     public function getOne($tableName, $columns = '*') {
         $res = $this->get($tableName, 1, $columns);
         return isset($res[0]) ? $res[0] : null;
     }
 
+    /**
+     * Insert method to add new row
+     */
     public function insert($tableName, $insertData) {
         if (!is_array($insertData)) {
             return false;
         }
-        
         $table = self::$prefix . $tableName;
         $columns = array_keys($insertData);
         $values = array_values($insertData);
-        $placeholders = str_repeat('?,', count($values) - 1) . '?';
-        
-        $this->_query = "INSERT INTO " . $table . 
-                        " (`" . implode('`, `', $columns) . "`) VALUES (" . 
-                        $placeholders . ")";
+        $params = array();
+        $placeholders = array();
+
+        foreach ($values as $value) {
+            $placeholders[] = '?';
+            $params[] = $value;
+        }
+
+        $this->_query = "INSERT INTO " . $table .
+                        " (`" . implode('`, `', $columns) . "`) VALUES (" .
+                        implode(', ', $placeholders) . ")";
         
         $stmt = $this->pdo->prepare($this->_query);
-        $stmt->execute($values);
-        
+        $status = $stmt->execute($params);
         $this->reset();
-        return $this->pdo->lastInsertId();
+
+        if ($status) {
+            $this->_lastInsertId = $this->pdo->lastInsertId();
+            return $this->_lastInsertId;
+        } else {
+            return false;
+        }
     }
 
-    public function update($tableName, $tableData) {
+    /**
+     * Update method
+     */
+    public function update($tableName, $tableData, $numRows = null) {
         if (!is_array($tableData)) {
             return false;
         }
-        
+
         $table = self::$prefix . $tableName;
         $this->_query = "UPDATE " . $table . " SET ";
-        
+        $params = array();
+
         foreach ($tableData as $column => $value) {
             $this->_query .= "`" . $column . "` = ?, ";
-            $this->_bindParams[] = $value;
+            $params[] = $value;
         }
-        
         $this->_query = rtrim($this->_query, ', ');
-        
-        if (!empty($this->_where)) {
-            $this->_query .= " WHERE";
-            $firstWhere = true;
-            
-            foreach ($this->_where as $where) {
-                if (count($where) === 4) {
-                    list($column, $operator, $value, $concat) = $where;
-                } else {
-                    list($column, $operator, $value) = $where;
-                    $concat = 'AND';
-                }
-                
-                if (!$firstWhere) {
-                    $this->_query .= " $concat";
-                }
-                
-                $this->_query .= " $column $operator ?";
-                $this->_bindParams[] = $value;
-                
-                $firstWhere = false;
-            }
-        }
-        
+
+        $this->_buildWhere();
+        $this->_buildOrderBy();
+        $this->_buildLimit($numRows);
+
+        $params = array_merge($params, $this->_bindParams);
+
         $stmt = $this->pdo->prepare($this->_query);
-        $result = $stmt->execute($this->_bindParams);
-        
+        $result = $stmt->execute($params);
+        $this->count = $stmt->rowCount();
         $this->reset();
         return $result;
     }
 
-    public function delete($tableName) {
+    /**
+     * Delete method
+     */
+    public function delete($tableName, $numRows = null) {
         $table = self::$prefix . $tableName;
         $this->_query = "DELETE FROM " . $table;
-        
-        if (!empty($this->_where)) {
-            $this->_query .= " WHERE";
-            $firstWhere = true;
-            
-            foreach ($this->_where as $where) {
-                if (count($where) === 4) {
-                    list($column, $operator, $value, $concat) = $where;
-                } else {
-                    list($column, $operator, $value) = $where;
-                    $concat = 'AND';
-                }
-                
-                if (!$firstWhere) {
-                    $this->_query .= " $concat";
-                }
-                
-                $this->_query .= " $column $operator ?";
-                $this->_bindParams[] = $value;
-                
-                $firstWhere = false;
-            }
-        }
-        
+
+        $this->_buildWhere();
+        $this->_buildOrderBy();
+        $this->_buildLimit($numRows);
+
         $stmt = $this->pdo->prepare($this->_query);
         $result = $stmt->execute($this->_bindParams);
-        
+        $this->count = $stmt->rowCount();
         $this->reset();
         return $result;
     }
 
-    public function setPrefix($prefix) {
-        self::$prefix = $prefix;
+    /**
+     * Where method
+     */
+    public function where($whereProp, $whereValue = null, $operator = '=', $cond = 'AND') {
+        if (count($this->_where) == 0) {
+            $cond = '';
+        }
+        $this->_where[] = array($cond, $whereProp, $operator, $whereValue);
         return $this;
     }
 
-    private function reset() {
-        $this->_where = array();
-        $this->_bindParams = array();
-        $this->_query = null;
-        $this->_join = array(); 
+    /**
+     * Or Where method
+     */
+    public function orWhere($whereProp, $whereValue = null, $operator = '=') {
+        return $this->where($whereProp, $whereValue, $operator, 'OR');
+    }
+
+    /**
+     * Having method
+     */
+    public function having($havingProp, $havingValue = null, $operator = '=', $cond = 'AND') {
+        if (count($this->_having) == 0) {
+            $cond = '';
+        }
+        $this->_having[] = array($cond, $havingProp, $operator, $havingValue);
+        return $this;
+    }
+
+    /**
+     * Or Having method
+     */
+    public function orHaving($havingProp, $havingValue = null, $operator = '=') {
+        return $this->having($havingProp, $havingValue, $operator, 'OR');
+    }
+
+    /**
+     * Join method
+     */
+    public function join($joinTable, $joinCondition, $joinType = '') {
+        $allowedTypes = array('LEFT', 'RIGHT', 'OUTER', 'INNER', 'LEFT OUTER', 'RIGHT OUTER', 'NATURAL');
+        $joinType = strtoupper(trim($joinType));
+        if ($joinType && !in_array($joinType, $allowedTypes)) {
+            throw new Exception('Wrong JOIN type: ' . $joinType);
+        }
+        $this->_join[] = array($joinType, $joinTable, $joinCondition);
+        return $this;
+    }
+
+    /**
+     * Order By method
+     */
+    public function orderBy($orderByField, $orderbyDirection = "DESC") {
+        $allowedDirection = array("ASC", "DESC");
+        $orderbyDirection = strtoupper(trim($orderbyDirection));
+
+        if (!in_array($orderbyDirection, $allowedDirection)) {
+            throw new Exception('Wrong order direction: ' . $orderbyDirection);
+        }
+
+        $this->_orderBy[$orderByField] = $orderbyDirection;
+        return $this;
+    }
+
+    /**
+     * Group By method
+     */
+    public function groupBy($groupByField) {
+        $this->_groupBy[] = $groupByField;
+        return $this;
+    }
+
+    /**
+     * Start Transaction
+     */
+    public function startTransaction() {
+        $this->_transaction_in_progress = $this->pdo->beginTransaction();
+        return $this;
+    }
+
+    /**
+     * Commit Transaction
+     */
+    public function commit() {
+        $this->_transaction_in_progress = false;
+        return $this->pdo->commit();
+    }
+
+    /**
+     * Rollback Transaction
+     */
+    public function rollback() {
+        $this->_transaction_in_progress = false;
+        return $this->pdo->rollBack();
+    }
+
+    /**
+     * Get Last Insert ID
+     */
+    public function getInsertId() {
+        return $this->_lastInsertId;
+    }
+
+    /**
+     * Escape method
+     */
+    public function escape($str) {
+        return substr($this->pdo->quote($str), 1, -1);
+    }
+
+    /**
+     * Build Pair method
+     */
+    protected function _buildPair($operator, $value) {
+        if (is_array($value)) {
+            return '(' . implode(', ', $value) . ')';
+        } else {
+            return $operator . $value;
+        }
+    }
+
+    /**
+     * Build JOIN clause
+     */
+    protected function _buildJoin() {
+        if (empty($this->_join)) {
+            return;
+        }
+
+        foreach ($this->_join as $data) {
+            list ($joinType, $joinTable, $joinCondition) = $data;
+
+            if (is_object($joinTable)) {
+                $joinStr = $this->_buildPair("", $joinTable);
+            } else {
+                $joinStr = $joinTable;
+            }
+
+            $this->_query .= " " . $joinType . " JOIN " . $joinStr .
+                ' ON ' . $joinCondition;
+        }
+    }
+
+    /**
+     * Build WHERE clause
+     */
+    protected function _buildWhere() {
+        if (empty($this->_where)) {
+            return;
+        }
+
+        $this->_query .= ' WHERE ';
+        $first = true;
+
+        foreach ($this->_where as $cond) {
+            list ($concat, $prop, $comp, $val) = $cond;
+
+            if ($first) {
+                $concat = '';
+            }
+
+            $this->_query .= " $concat $prop";
+
+            if (is_array($val)) {
+                if ($comp == 'IN' || $comp == 'NOT IN') {
+                    $placeholders = implode(', ', array_fill(0, count($val), '?'));
+                    $this->_query .= " $comp ($placeholders)";
+                    $this->_bindParams = array_merge($this->_bindParams, $val);
+                } elseif ($comp == 'BETWEEN') {
+                    $this->_query .= " $comp ? AND ?";
+                    $this->_bindParams = array_merge($this->_bindParams, $val);
+                } else {
+                    throw new Exception("Unsupported operator with array value: $comp");
+                }
+            } else {
+                if ($comp == 'IS NULL' || $comp == 'IS NOT NULL') {
+                    $this->_query .= " $comp";
+                } else {
+                    $this->_query .= " $comp ?";
+                    $this->_bindParams[] = $val;
+                }
+            }
+
+            $first = false;
+        }
+    }
+
+    /**
+     * Build HAVING clause
+     */
+    protected function _buildHaving() {
+        if (empty($this->_having)) {
+            return;
+        }
+
+        $this->_query .= ' HAVING ';
+        $first = true;
+
+        foreach ($this->_having as $cond) {
+            list ($concat, $prop, $comp, $val) = $cond;
+
+            if ($first) {
+                $concat = '';
+            }
+
+            $this->_query .= " $concat $prop";
+
+            if (is_array($val)) {
+                if ($comp == 'IN' || $comp == 'NOT IN') {
+                    $placeholders = implode(', ', array_fill(0, count($val), '?'));
+                    $this->_query .= " $comp ($placeholders)";
+                    $this->_bindParams = array_merge($this->_bindParams, $val);
+                } elseif ($comp == 'BETWEEN') {
+                    $this->_query .= " $comp ? AND ?";
+                    $this->_bindParams = array_merge($this->_bindParams, $val);
+                } else {
+                    throw new Exception("Unsupported operator with array value: $comp");
+                }
+            } else {
+                if ($comp == 'IS NULL' || $comp == 'IS NOT NULL') {
+                    $this->_query .= " $comp";
+                } else {
+                    $this->_query .= " $comp ?";
+                    $this->_bindParams[] = $val;
+                }
+            }
+
+            $first = false;
+        }
+    }
+
+    /**
+     * Build GROUP BY clause
+     */
+    protected function _buildGroupBy() {
+        if (empty($this->_groupBy)) {
+            return;
+        }
+
+        $this->_query .= " GROUP BY " . implode(', ', $this->_groupBy);
+    }
+
+    /**
+     * Build ORDER BY clause
+     */
+    protected function _buildOrderBy() {
+        if (empty($this->_orderBy)) {
+            return;
+        }
+
+        $order = array();
+        foreach ($this->_orderBy as $field => $dir) {
+            $order[] = "$field $dir";
+        }
+
+        $this->_query .= " ORDER BY " . implode(', ', $order);
+    }
+
+    /**
+     * Build LIMIT clause
+     */
+    protected function _buildLimit($numRows) {
+        if (isset($numRows)) {
+            if (is_array($numRows)) {
+                $this->_query .= ' LIMIT ' . (int) $numRows[1] . ' OFFSET ' . (int) $numRows[0];
+            } else {
+                $this->_query .= ' LIMIT ' . (int) $numRows;
+            }
+        }
+    }
+
+    /**
+     * Return the last executed query
+     */
+    public function getLastQuery() {
+        return $this->_query;
+    }
+
+    /**
+     * Return the last error
+     */
+    public function getLastError() {
+        $errorInfo = $this->pdo->errorInfo();
+        return isset($errorInfo[2]) ? $errorInfo[2] : '';
+    }
+
+    /**
+     * Pagination wrapper to get()
+     *
+     * @access public
+     *
+     * @param string       $table  The name of the database table to work with
+     * @param int          $page   Page number
+     * @param array|string $fields Array or comma separated list of fields to fetch
+     *
+     * @return array
+     */
+    public function paginate($table, $page, $fields = null) {
+        $offset = $this->pageLimit * ($page - 1);
+        $res = $this->withTotalCount()->get($table, array($offset, $this->pageLimit), $fields);
+        $this->totalPages = ceil($this->totalCount / $this->pageLimit);
+        return $res;
+    }
+
+    /**
+     * Enable SQL_CALC_FOUND_ROWS in the get queries
+     */
+    public function withTotalCount() {
+        // SQLite doesn't support SQL_CALC_FOUND_ROWS, need alternative
+        // So, after executing the query, set totalCount = count of all records
+
+        // For simplicity, we can use COUNT(*) to get total records
+        // We'll implement this in get() method
+
+        return $this;
+    }
+
+    /**
+     * Map result to column value
+     */
+    public function map($idField) {
+        $this->_mapKey = $idField;
+        return $this;
+    }
+
+    /**
+     * Helper function to determine data type
+     */
+    protected function _determineType($item) {
+        switch (gettype($item)) {
+            case 'NULL':
+                return PDO::PARAM_NULL;
+            case 'boolean':
+                return PDO::PARAM_BOOL;
+            case 'integer':
+                return PDO::PARAM_INT;
+            case 'double':
+            case 'string':
+            default:
+                return PDO::PARAM_STR;
+        }
+    }
+
+    /**
+     * Helper to bind parameters
+     */
+    protected function _bindParams($stmt, $params) {
+        foreach ($params as $key => $value) {
+            $stmt->bindValue($key+1, $value, $this->_determineType($value));
+        }
+    }
+
+    /**
+     * Method to check if table exists
+     */
+    public function tableExists($tableName) {
+        try {
+            $result = $this->query("SELECT name FROM sqlite_master WHERE type='table' AND name=?", array($tableName));
+            return count($result) > 0;
+        } catch (Exception $e) {
+            return false;
+        }
+    }
+
+    /**
+     * Function to fetch data
+     */
+    public function query($sql, $params = array()) {
+        $this->_query = $sql;
+        $stmt = $this->pdo->prepare($this->_query);
+        $stmt->execute($params);
+        return $stmt->fetchAll($this->_fetchMode);
+    }
+
+    /**
+     * Function to get row count
+     */
+    public function getCount() {
+        return $this->count;
     }
 }
+?>
