@@ -132,6 +132,10 @@ class Database {
         foreach ($columns as $name => $type) {
             $columns_sql[] = "$name $type";
         }
+        $columns_sql[] = "created_at INTEGER NOT NULL";
+        $columns_sql[] = "updated_at INTEGER NOT NULL";
+        $columns_sql[] = "deleted_at INTEGER DEFAULT NULL";
+
         $sql = "CREATE TABLE IF NOT EXISTS $table (" . implode(", ", $columns_sql) . ")";
         try {
             $this->rawQuery($sql);
@@ -295,7 +299,9 @@ class Database {
         }
         $table = self::$prefix . $tableName;
         $columns = array_keys($insertData);
+        $columns = array_merge($columns, ['created_at', 'updated_at']);
         $values = array_values($insertData);
+        $values = array_merge(array_values($insertData), [time(), time()]);
         $params = array();
         $placeholders = array();
 
@@ -319,16 +325,21 @@ class Database {
             return false;
         }
     }
-
+    public function toTime($timestamp, $format=false, $utc = 'EUROPE/MOSCOW') {
+        date_default_timezone_set($utc);
+        $updateFormat = !$format ? 'Y-m-d H:i:s' : $format;
+        return date($updateFormat, $timestamp);
+    }
     /**
      * Update method
      */
-    public function update($tableName, $tableData, $numRows = null) {
-        if (!is_array($tableData)) {
+    public function update($tableName, $payload, $numRows = null) {
+        if (!is_array($payload)) {
             return false;
         }
-
+        $tableData = array_merge($payload, ['updated_at' => time()]);        
         $table = self::$prefix . $tableName;
+
         $this->_query = "UPDATE " . $table . " SET ";
         $params = array();
 
@@ -336,6 +347,7 @@ class Database {
             $this->_query .= "`" . $column . "` = ?, ";
             $params[] = $value;
         }
+      
         $this->_query = rtrim($this->_query, ', ');
 
         $this->_buildWhere();
@@ -345,6 +357,7 @@ class Database {
         $params = array_merge($params, $this->_bindParams);
 
         $stmt = $this->pdo->prepare($this->_query);
+
         $result = $stmt->execute($params);
         $this->count = $stmt->rowCount();
         $this->reset();
