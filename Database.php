@@ -107,7 +107,117 @@ class Database {
         self::$prefix = $prefix;
         return $this;
     }
+    public function createTable($table, $columns) {
+        /**
+         * Создает таблицу в базе данных.
+         * @param string $table Название таблицы
+         * @param array $columns Ассоциативный массив ['column_name' => 'data_type']
+         * @return bool
+         * 
+         * Возможные значения data_type:
+         * - INTEGER: Целочисленный тип, может использоваться с PRIMARY KEY AUTOINCREMENT
+         * - TEXT: Текстовое поле
+         * - REAL: Число с плавающей точкой
+         * - BLOB: Двоичные данные
+         * - NUMERIC: Числовой тип (может содержать дату/время)
+         * 
+         * Допустимые свойства полей:
+         * - PRIMARY KEY: Уникальный идентификатор
+         * - AUTOINCREMENT: Автоматическое увеличение значения (только с INTEGER PRIMARY KEY)
+         * - NOT NULL: Запрещает NULL-значения
+         * - UNIQUE: Требует уникальности значений
+         * - DEFAULT value: Устанавливает значение по умолчанию
+         */
+        $columns_sql = [];
+        foreach ($columns as $name => $type) {
+            $columns_sql[] = "$name $type";
+        }
+        $columns_sql[] = "created_at INTEGER NOT NULL";
+        $columns_sql[] = "updated_at INTEGER NOT NULL";
+        $columns_sql[] = "deleted_at INTEGER DEFAULT NULL";
 
+        $sql = "CREATE TABLE IF NOT EXISTS $table (" . implode(", ", $columns_sql) . ")";
+        try {
+            $this->rawQuery($sql);
+            return true;
+        } catch (e) {
+            return false;
+        }
+        
+    }
+    public function dropTable($table) {
+        /**
+         * Удаляет таблицу из базы данных.
+         * @param string $table Название таблицы
+         * @return bool
+         */
+        $sql = "DROP TABLE IF EXISTS $table";
+        try {
+            $this->rawQuery($sql);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+    public function addColumn($table, $column, $type) {
+        /**
+         * Добавляет новую колонку в существующую таблицу.
+         * @param string $table Название таблицы
+         * @param string $column Название колонки
+         * @param string $type Тип данных колонки (например, TEXT, INTEGER и т. д.)
+         * @return bool
+         */
+        $sql = "ALTER TABLE $table ADD COLUMN $column $type";
+        $this->rawQuery($sql);
+        return true;
+      
+    }
+    public function dd($data,$exit = false){
+        echo '<pre>';
+        if($exit){
+            exit(var_dump($data));
+        }
+        var_dump($data);
+        echo '</pre>';
+    }
+    public function dropColumn($table, $column) {
+        /**
+         * Удаляет колонку из таблицы (требуется обходной путь, так как SQLite не поддерживает удаление колонок напрямую).
+         * @param string $table Название таблицы
+         * @param string $column Название удаляемой колонки
+         * @return bool
+         */
+
+            // Получаем список существующих колонок
+            $stmt = $this->rawQuery("PRAGMA table_info($table)");
+
+            // // Формируем новый список колонок, исключая удаляемый
+            $newColumns = array_filter($stmt, function($col) use ($column) {
+                return $col['name'] !== $column;
+            });
+ 
+            
+            if (count($newColumns) === count($stmt)) {
+                throw new Exception("Column not found: $column");
+            }
+            
+            $columnNames = array_map(fn($col) => $col['name'] . ' ' . $col['type'], $newColumns);
+            $columnNamesList = implode(", ", array_map(fn($col) => $col['name'], $newColumns));
+            
+            // Создаем временную таблицу
+            $tempTable = $table . "_temp";
+            $this->rawQuery("CREATE TABLE $tempTable ($columnNamesList)");
+
+            // Копируем данные
+            $this->rawQuery("INSERT INTO $tempTable SELECT $columnNamesList FROM $table");
+            
+            // Удаляем старую таблицу и переименовываем временную
+            $this->dropTable($table);
+            $this->rawQuery("ALTER TABLE $tempTable RENAME TO $table");
+            
+            return true;
+       
+    }
     /**
      * Execute raw SQL query.
      *
@@ -189,7 +299,9 @@ class Database {
         }
         $table = self::$prefix . $tableName;
         $columns = array_keys($insertData);
+        $columns = array_merge($columns, ['created_at', 'updated_at']);
         $values = array_values($insertData);
+        $values = array_merge(array_values($insertData), [time(), time()]);
         $params = array();
         $placeholders = array();
 
@@ -201,7 +313,7 @@ class Database {
         $this->_query = "INSERT INTO " . $table .
                         " (`" . implode('`, `', $columns) . "`) VALUES (" .
                         implode(', ', $placeholders) . ")";
-        
+
         $stmt = $this->pdo->prepare($this->_query);
         $status = $stmt->execute($params);
         $this->reset();
@@ -213,16 +325,21 @@ class Database {
             return false;
         }
     }
-
+    public function toTime($timestamp, $format=false, $utc = 'EUROPE/MOSCOW') {
+        date_default_timezone_set($utc);
+        $updateFormat = !$format ? 'Y-m-d H:i:s' : $format;
+        return date($updateFormat, $timestamp);
+    }
     /**
      * Update method
      */
-    public function update($tableName, $tableData, $numRows = null) {
-        if (!is_array($tableData)) {
+    public function update($tableName, $payload, $numRows = null) {
+        if (!is_array($payload)) {
             return false;
         }
-
+        $tableData = array_merge($payload, ['updated_at' => time()]);        
         $table = self::$prefix . $tableName;
+
         $this->_query = "UPDATE " . $table . " SET ";
         $params = array();
 
@@ -230,6 +347,7 @@ class Database {
             $this->_query .= "`" . $column . "` = ?, ";
             $params[] = $value;
         }
+      
         $this->_query = rtrim($this->_query, ', ');
 
         $this->_buildWhere();
@@ -239,6 +357,7 @@ class Database {
         $params = array_merge($params, $this->_bindParams);
 
         $stmt = $this->pdo->prepare($this->_query);
+
         $result = $stmt->execute($params);
         $this->count = $stmt->rowCount();
         $this->reset();
